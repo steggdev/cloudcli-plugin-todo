@@ -56,7 +56,7 @@ const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
 export function mount(container: HTMLElement, api: PluginAPI): void {
   let todos: Todo[] = [];
-  let projectOnly = true;
+  let projectOnly = false;
   let loaded = false;
   let errorMsg = '';
 
