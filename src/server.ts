@@ -1,135 +1,154 @@
+/**
+ * Todo plugin — backend server subprocess.
+ *
+ * Persists todos as JSON and exposes a small REST API reached through
+ * the host proxy (api.rpc). Uses only Node.js built-in modules.
+ */
+
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { URL } from 'node:url';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-interface FileInfo {
-  full: string;
-  rel: string;
-  ext: string;
-  size: number;
-  mtime: number;
+interface Todo {
+  id: string;
+  text: string;
+  done: boolean;
+  project: string;
+  createdAt: number;
 }
 
-interface ProjectStats {
-  totalFiles: number;
-  totalLines: number;
-  totalSize: number;
-  byExtension: [string, number][];
-  largest: { name: string; size: number }[];
-  recent: { name: string; mtime: number }[];
+// ── Persistence ────────────────────────────────────────────────────────
+
+const DATA_DIR = path.join(process.env.HOME || '', '.cloudcli-todo-plugin');
+const DATA_FILE = path.join(DATA_DIR, 'todos.json');
+
+function ensureStore(): void {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, '[]', 'utf-8');
 }
 
-// ── Constants ──────────────────────────────────────────────────────────
-
-const TEXT_EXTS = new Set([
-  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte', '.astro',
-  '.css', '.scss', '.sass', '.less',
-  '.html', '.htm', '.xml', '.svg',
-  '.json', '.yaml', '.yml', '.toml', '.ini',
-  '.md', '.mdx', '.txt', '.rst',
-  '.py', '.rb', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.hpp', '.cs',
-  '.sh', '.bash', '.zsh', '.fish',
-  '.sql', '.graphql', '.gql',
-]);
-
-const SKIP_DIRS = new Set([
-  'node_modules', '.git', 'dist', 'build', '.next', '.nuxt',
-  'coverage', '.cache', '__pycache__', '.venv', 'venv',
-  'target', 'vendor', '.turbo', 'out', '.output', 'tmp',
-]);
-
-// ── Filesystem helpers ─────────────────────────────────────────────────
-
-function scan(dir: string, max = 5000): FileInfo[] {
-  const files: FileInfo[] = [];
-  (function walk(d: string, depth: number): void {
-    if (depth > 6 || files.length >= max) return;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (files.length >= max) break;
-      if (e.name.startsWith('.') && e.name !== '.env') continue;
-      const full = path.join(d, e.name);
-      if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name)) walk(full, depth + 1);
-      } else if (e.isFile()) {
-        try {
-          const stat = fs.statSync(full);
-          files.push({
-            full,
-            rel: path.relative(dir, full),
-            ext: path.extname(e.name).toLowerCase() || '(none)',
-            size: stat.size,
-            mtime: stat.mtimeMs,
-          });
-        } catch {
-          /* skip unreadable */
-        }
-      }
-    }
-  })(dir, 0);
-  return files;
-}
-
-function countLines(full: string, size: number): number {
-  if (size > 256 * 1024) return 0; // skip large files
+function readTodos(): Todo[] {
+  ensureStore();
   try {
-    return (fs.readFileSync(full, 'utf-8').match(/\n/g) || []).length + 1;
+    const raw = fs.readFileSync(DATA_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as Todo[]) : [];
   } catch {
-    return 0;
+    return [];
   }
 }
 
-function getStats(projectPath: string): ProjectStats {
-  if (!projectPath || !path.isAbsolute(projectPath)) throw new Error('Invalid path');
-  if (!fs.existsSync(projectPath)) throw new Error('Path does not exist');
+function writeTodos(todos: Todo[]): void {
+  ensureStore();
+  fs.writeFileSync(DATA_FILE, JSON.stringify(todos, null, 2), 'utf-8');
+}
 
-  const files = scan(projectPath);
-  const byExt: Record<string, number> = {};
-  let totalLines = 0;
-  let totalSize = 0;
+function makeId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
-  for (const f of files) {
-    byExt[f.ext] = (byExt[f.ext] || 0) + 1;
-    totalSize += f.size;
-    if (TEXT_EXTS.has(f.ext)) totalLines += countLines(f.full, f.size);
-  }
+// ── Request helpers ────────────────────────────────────────────────────
 
-  return {
-    totalFiles: files.length,
-    totalLines,
-    totalSize,
-    byExtension: Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 12),
-    largest: [...files].sort((a, b) => b.size - a.size).slice(0, 6).map((f) => ({ name: f.rel, size: f.size })),
-    recent: [...files].sort((a, b) => b.mtime - a.mtime).slice(0, 6).map((f) => ({ name: f.rel, mtime: f.mtime })),
-  };
+function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (chunk) => {
+      data += chunk;
+      if (data.length > 1_000_000) req.destroy(); // basic guard
+    });
+    req.on('end', () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data) as Record<string, unknown>);
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(payload));
 }
 
 // ── HTTP server ────────────────────────────────────────────────────────
 
-const server = http.createServer((req, res) => {
-  res.setHeader('Content-Type', 'application/json');
+const server = http.createServer(async (req, res) => {
+  try {
+    const method = req.method || 'GET';
+    const { pathname } = new URL(req.url || '/', 'http://localhost');
 
-  if (req.method === 'GET' && req.url?.startsWith('/stats')) {
-    try {
-      const { searchParams } = new URL(req.url, 'http://localhost');
-      const stats = getStats(searchParams.get('path') ?? '');
-      res.end(JSON.stringify(stats));
-    } catch (err) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: (err as Error).message }));
+    // GET /todos -> all todos
+    if (method === 'GET' && pathname === '/todos') {
+      sendJson(res, 200, readTodos());
+      return;
     }
-    return;
-  }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
+    // POST /todos -> create
+    if (method === 'POST' && pathname === '/todos') {
+      const body = await readBody(req);
+      const text = typeof body.text === 'string' ? body.text.trim() : '';
+      const project = typeof body.project === 'string' ? body.project : '';
+      if (!text) {
+        sendJson(res, 400, { error: 'text is required' });
+        return;
+      }
+      const todo: Todo = {
+        id: makeId(),
+        text,
+        done: false,
+        project,
+        createdAt: Date.now(),
+      };
+      const todos = readTodos();
+      todos.push(todo);
+      writeTodos(todos);
+      sendJson(res, 201, todo);
+      return;
+    }
+
+    // PATCH /todos/:id -> update
+    const patchMatch = method === 'PATCH' && /^\/todos\/([^/]+)$/.exec(pathname);
+    if (patchMatch) {
+      const id = decodeURIComponent(patchMatch[1]);
+      const body = await readBody(req);
+      const todos = readTodos();
+      const todo = todos.find((t) => t.id === id);
+      if (!todo) {
+        sendJson(res, 404, { error: 'Not found' });
+        return;
+      }
+      if (typeof body.done === 'boolean') todo.done = body.done;
+      if (typeof body.text === 'string' && body.text.trim()) todo.text = body.text.trim();
+      writeTodos(todos);
+      sendJson(res, 200, todo);
+      return;
+    }
+
+    // DELETE /todos/:id -> delete
+    const delMatch = method === 'DELETE' && /^\/todos\/([^/]+)$/.exec(pathname);
+    if (delMatch) {
+      const id = decodeURIComponent(delMatch[1]);
+      const todos = readTodos();
+      const next = todos.filter((t) => t.id !== id);
+      if (next.length === todos.length) {
+        sendJson(res, 404, { error: 'Not found' });
+        return;
+      }
+      writeTodos(next);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    sendJson(res, 404, { error: 'Not found' });
+  } catch (err) {
+    sendJson(res, 400, { error: (err as Error).message });
+  }
 });
 
 server.listen(0, '127.0.0.1', () => {

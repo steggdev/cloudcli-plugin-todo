@@ -1,45 +1,22 @@
 /**
- * Project Stats plugin — module entry point.
+ * Todo plugin — module entry point.
  *
  * The host calls mount(container, api) when the plugin tab is activated and
- * unmount(container) when it is torn down.
+ * unmount(container) when it is torn down. All backend calls go through
+ * api.rpc; the UI respects the active theme and re-renders on context change.
  */
 
 import type { PluginAPI, PluginContext } from './types.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-interface FileEntry {
-  name: string;
-  size: number;
-  mtime: number;
+interface Todo {
+  id: string;
+  text: string;
+  done: boolean;
+  project: string;
+  createdAt: number;
 }
-
-interface ProjectStats {
-  totalFiles: number;
-  totalLines: number;
-  totalSize: number;
-  byExtension: [string, number][];
-  largest: FileEntry[];
-  recent: FileEntry[];
-}
-
-interface StatsCache {
-  projectPath: string;
-  stats: ProjectStats;
-}
-
-// ── Constants ──────────────────────────────────────────────────────────
-
-const PALETTE = [
-  '#6366f1', '#22d3ee', '#f59e0b', '#10b981',
-  '#f43f5e', '#a78bfa', '#fb923c', '#34d399',
-  '#60a5fa', '#e879f9', '#facc15', '#4ade80',
-];
-
-const MONO = "'JetBrains Mono', 'Fira Code', ui-monospace, monospace";
-
-// ── Theme helpers ──────────────────────────────────────────────────────
 
 interface ThemeColors {
   bg: string;
@@ -48,308 +25,332 @@ interface ThemeColors {
   text: string;
   muted: string;
   accent: string;
-  dim: string;
+  danger: string;
 }
 
 function themeColors(dark: boolean): ThemeColors {
   return dark
     ? {
-        bg: '#08080f',
-        surface: '#0e0e1a',
-        border: '#1a1a2c',
+        bg: '#0e0e1a',
+        surface: '#16162a',
+        border: '#262640',
         text: '#e2e0f0',
-        muted: '#52507a',
-        accent: '#fbbf24',
-        dim: 'rgba(251,191,36,0.1)',
+        muted: '#7c7aa0',
+        accent: '#6366f1',
+        danger: '#f43f5e',
       }
     : {
         bg: '#fafaf9',
         surface: '#ffffff',
         border: '#e8e6f0',
-        text: '#0f0e1a',
-        muted: '#9490b0',
-        accent: '#d97706',
-        dim: 'rgba(217,119,6,0.08)',
+        text: '#15141f',
+        muted: '#8a87a5',
+        accent: '#6366f1',
+        danger: '#e11d48',
       };
 }
 
-// ── Utility helpers ────────────────────────────────────────────────────
-
-function ensureAssets(): void {
-  if (document.getElementById('ps-font')) return;
-
-  const link = document.createElement('link');
-  link.id = 'ps-font';
-  link.rel = 'stylesheet';
-  link.href = 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap';
-  document.head.appendChild(link);
-
-  const s = document.createElement('style');
-  s.id = 'ps-styles';
-  s.textContent = `
-    @keyframes ps-grow   { from { width: 0 } }
-    @keyframes ps-fadeup { from { opacity:0; transform:translateY(6px) } to { opacity:1; transform:translateY(0) } }
-    @keyframes ps-pulse  { 0%,100% { opacity:.3 } 50% { opacity:.6 } }
-    .ps-bar   { animation: ps-grow   0.75s cubic-bezier(.16,1,.3,1) both }
-    .ps-up    { animation: ps-fadeup 0.4s  ease both }
-    .ps-skel  { animation: ps-pulse  1.6s  ease infinite }
-  `;
-  document.head.appendChild(s);
-}
-
-function fmt(b: number): string {
-  if (b < 1024) return `${b}B`;
-  if (b < 1048576) return `${(b / 1024).toFixed(1)}KB`;
-  return `${(b / 1048576).toFixed(1)}MB`;
-}
-
-function ago(ms: number): string {
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return 'just now';
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-}
-
-function countUp(el: HTMLElement, target: number, formatFn: (n: number) => string, duration = 900): void {
-  const start = performance.now();
-  function tick(now: number): void {
-    const p = Math.min((now - start) / duration, 1);
-    const ease = 1 - (1 - p) ** 3;
-    el.textContent = formatFn(Math.round(target * ease));
-    if (p < 1) requestAnimationFrame(tick);
-  }
-  requestAnimationFrame(tick);
-}
-
-function skeletonRows(c: ThemeColors, widths: number[]): string {
-  return widths
-    .map(
-      (w, i) => `
-    <div class="ps-skel" style="
-      height:10px;width:${w}%;background:${c.muted};border-radius:2px;
-      margin-bottom:8px;animation-delay:${i * 0.1}s
-    "></div>`,
-    )
-    .join('');
-}
+const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
 // ── Mount / Unmount ────────────────────────────────────────────────────
 
 export function mount(container: HTMLElement, api: PluginAPI): void {
-  ensureAssets();
-  let cache: StatsCache | null = null;
+  let todos: Todo[] = [];
+  let projectOnly = true;
+  let loaded = false;
+  let errorMsg = '';
 
   const root = document.createElement('div');
   Object.assign(root.style, {
     height: '100%',
     overflowY: 'auto',
     boxSizing: 'border-box',
-    padding: '24px',
-    fontFamily: MONO,
+    padding: '16px',
+    fontFamily: FONT,
   });
   container.appendChild(root);
 
-  function render(ctx: PluginContext, stats: ProjectStats | null): void {
+  function currentProjectPath(): string {
+    return api.context.project?.path ?? '';
+  }
+
+  function visibleTodos(): Todo[] {
+    const p = currentProjectPath();
+    const list = projectOnly && p ? todos.filter((t) => t.project === p) : todos;
+    return [...list].sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  async function loadTodos(): Promise<void> {
+    try {
+      const data = (await api.rpc('GET', '/todos')) as Todo[];
+      todos = Array.isArray(data) ? data : [];
+      errorMsg = '';
+    } catch (err) {
+      errorMsg = (err as Error).message;
+    }
+    loaded = true;
+    render();
+  }
+
+  async function addTodo(text: string): Promise<void> {
+    const value = text.trim();
+    if (!value) return;
+    try {
+      const todo = (await api.rpc('POST', '/todos', {
+        text: value,
+        project: currentProjectPath(),
+      })) as Todo;
+      todos.push(todo);
+      errorMsg = '';
+    } catch (err) {
+      errorMsg = (err as Error).message;
+    }
+    render();
+  }
+
+  async function toggleTodo(todo: Todo): Promise<void> {
+    try {
+      const updated = (await api.rpc('PATCH', `/todos/${encodeURIComponent(todo.id)}`, {
+        done: !todo.done,
+      })) as Todo;
+      const i = todos.findIndex((t) => t.id === todo.id);
+      if (i >= 0) todos[i] = updated;
+      errorMsg = '';
+    } catch (err) {
+      errorMsg = (err as Error).message;
+    }
+    render();
+  }
+
+  async function deleteTodo(todo: Todo): Promise<void> {
+    try {
+      await api.rpc('DELETE', `/todos/${encodeURIComponent(todo.id)}`);
+      todos = todos.filter((t) => t.id !== todo.id);
+      errorMsg = '';
+    } catch (err) {
+      errorMsg = (err as Error).message;
+    }
+    render();
+  }
+
+  function render(): void {
+    const ctx: PluginContext = api.context;
     const c = themeColors(ctx.theme === 'dark');
     root.style.background = c.bg;
     root.style.color = c.text;
+    root.innerHTML = '';
 
-    if (!ctx.project) {
-      root.innerHTML = `
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:50%;gap:14px">
-          <pre style="font-size:0.75rem;color:${c.muted};opacity:0.5;line-height:1.6;text-align:center">~/.projects/
-└── (none selected)</pre>
-          <div style="font-size:0.72rem;color:${c.muted};letter-spacing:0.1em;text-transform:uppercase">select a project</div>
-        </div>`;
-      return;
-    }
+    // Header / add form
+    const header = document.createElement('div');
+    Object.assign(header.style, { maxWidth: '640px', margin: '0 auto' });
 
-    if (!stats) {
-      root.innerHTML = `
-        <div style="margin-bottom:24px">
-          <div style="font-size:1.3rem;font-weight:700">${ctx.project.name}<span style="color:${c.accent}">▌</span></div>
-          <div style="font-size:0.7rem;color:${c.muted};margin-top:4px">${ctx.project.path}</div>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px">
-          ${[0, 1, 2]
-            .map(
-              () => `
-            <div style="background:${c.surface};border:1px solid ${c.border};border-radius:3px;padding:18px">
-              ${skeletonRows(c, [65])}
-              ${skeletonRows(c, [40])}
-            </div>`,
-            )
-            .join('')}
-        </div>
-        <div style="background:${c.surface};border:1px solid ${c.border};border-radius:3px;padding:18px;margin-bottom:12px">
-          ${[75, 55, 38, 22, 14]
-            .map(
-              (w, i) => `
-            <div style="display:flex;gap:10px;align-items:center;margin-bottom:7px">
-              <div class="ps-skel" style="width:44px;height:8px;background:${c.muted};border-radius:2px;animation-delay:${i * 0.08}s"></div>
-              <div class="ps-skel" style="width:${w}%;height:4px;background:${c.muted};border-radius:1px;animation-delay:${i * 0.08}s"></div>
-            </div>`,
-            )
-            .join('')}
-        </div>`;
-      return;
-    }
-
-    const maxCount = stats.byExtension[0]?.[1] || 1;
-
-    root.innerHTML = `
-      <div class="ps-up" style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px">
-        <div style="min-width:0;flex:1">
-          <div style="font-size:1.3rem;font-weight:700;letter-spacing:-0.02em;word-break:break-all">
-            ${ctx.project.name}<span style="color:${c.accent}">▌</span>
-          </div>
-          <div style="font-size:0.7rem;color:${c.muted};margin-top:4px;word-break:break-all">${ctx.project.path}</div>
-        </div>
-        <button id="ps-refresh" style="
-          flex-shrink:0;margin-left:16px;padding:5px 12px;
-          background:transparent;border:1px solid ${c.border};
-          color:${c.muted};font-family:${MONO};font-size:0.7rem;
-          border-radius:3px;cursor:pointer;letter-spacing:0.05em;
-          transition:all 0.15s;
-        " onmouseover="this.style.borderColor='${c.accent}';this.style.color='${c.accent}'"
-           onmouseout="this.style.borderColor='${c.border}';this.style.color='${c.muted}'">
-          ↻ refresh
-        </button>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px">
-        ${(
-          [
-            ['files', stats.totalFiles, (n: number) => n.toLocaleString()],
-            ['lines', stats.totalLines, (n: number) => n.toLocaleString()],
-            ['total size', stats.totalSize, fmt],
-          ] as [string, number, (n: number) => string][]
-        )
-          .map(
-            ([label, , ], i) => `
-          <div class="ps-up" style="
-            background:${c.surface};border:1px solid ${c.border};
-            border-radius:3px;padding:18px;animation-delay:${i * 0.06}s
-          ">
-            <div id="ps-m-${i}" style="
-              font-size:1.9rem;font-weight:700;letter-spacing:-0.04em;
-              line-height:1;color:${c.text};
-            ">0</div>
-            <div style="font-size:0.65rem;color:${c.muted};margin-top:6px;letter-spacing:0.1em;text-transform:uppercase">${label}</div>
-          </div>`,
-          )
-          .join('')}
-      </div>
-
-      <div class="ps-up" style="
-        background:${c.surface};border:1px solid ${c.border};
-        border-radius:3px;padding:18px;margin-bottom:12px;animation-delay:0.12s
-      ">
-        <div style="font-size:0.62rem;color:${c.muted};letter-spacing:0.12em;text-transform:uppercase;margin-bottom:14px">file types</div>
-        ${stats.byExtension
-          .map(
-            ([ext, count], i) => `
-          <div class="ps-up" style="display:flex;align-items:center;gap:10px;margin-bottom:7px;animation-delay:${0.15 + i * 0.035}s">
-            <div style="width:50px;font-size:0.68rem;text-align:right;color:${c.muted};flex-shrink:0">${ext}</div>
-            <div style="flex:1;height:4px;background:${c.border};border-radius:1px;overflow:hidden">
-              <div class="ps-bar" style="
-                height:100%;width:${Math.round((count / maxCount) * 100)}%;
-                background:${PALETTE[i % PALETTE.length]};
-                animation-delay:${0.18 + i * 0.035}s;border-radius:1px;
-              "></div>
-            </div>
-            <div style="width:30px;font-size:0.68rem;color:${c.muted};text-align:right;flex-shrink:0">${count}</div>
-          </div>`,
-          )
-          .join('')}
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        ${(
-          [
-            ['largest files', stats.largest.map((f) => [f.name, fmt(f.size)])],
-            ['recently modified', stats.recent.map((f) => [f.name, ago(f.mtime)])],
-          ] as [string, [string, string][]][]
-        )
-          .map(
-            ([title, rows], ci) => `
-          <div class="ps-up" style="
-            background:${c.surface};border:1px solid ${c.border};
-            border-radius:3px;padding:18px;animation-delay:${0.18 + ci * 0.05}s
-          ">
-            <div style="font-size:0.62rem;color:${c.muted};letter-spacing:0.12em;text-transform:uppercase;margin-bottom:12px">${title}</div>
-            ${rows
-              .map(
-                ([name, val], ri) => `
-              <div class="ps-up" style="
-                display:flex;justify-content:space-between;align-items:baseline;
-                padding:4px 0;border-bottom:1px solid ${c.border};font-size:0.7rem;
-                animation-delay:${0.2 + ci * 0.05 + ri * 0.03}s;gap:8px;
-              ">
-                <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;opacity:0.75" title="${name}">${name}</div>
-                <div style="color:${c.accent};flex-shrink:0;opacity:0.9">${val}</div>
-              </div>`,
-              )
-              .join('')}
-          </div>`,
-          )
-          .join('')}
-      </div>
-    `;
-
-    // Count-up animations for metric cards
-    const metrics: [number, number, (n: number) => string][] = [
-      [0, stats.totalFiles, (n: number) => n.toLocaleString()],
-      [1, stats.totalLines, (n: number) => n.toLocaleString()],
-      [2, stats.totalSize, fmt],
-    ];
-    for (const [i, val, formatFn] of metrics) {
-      const el = root.querySelector(`#ps-m-${i}`) as HTMLElement | null;
-      if (el) countUp(el, val, formatFn);
-    }
-
-    root.querySelector('#ps-refresh')?.addEventListener('click', () => {
-      cache = null;
-      load(api.context);
+    const title = document.createElement('div');
+    Object.assign(title.style, {
+      fontSize: '1.15rem',
+      fontWeight: '700',
+      marginBottom: '12px',
+      letterSpacing: '-0.01em',
     });
+    title.textContent = 'Todo';
+    header.appendChild(title);
+
+    const form = document.createElement('form');
+    Object.assign(form.style, { display: 'flex', gap: '8px', marginBottom: '12px' });
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Add a todo…';
+    Object.assign(input.style, {
+      flex: '1',
+      minWidth: '0',
+      padding: '10px 12px',
+      fontSize: '0.9rem',
+      fontFamily: FONT,
+      color: c.text,
+      background: c.surface,
+      border: `1px solid ${c.border}`,
+      borderRadius: '8px',
+      outline: 'none',
+      boxSizing: 'border-box',
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'submit';
+    addBtn.textContent = 'Add';
+    Object.assign(addBtn.style, {
+      flexShrink: '0',
+      padding: '10px 18px',
+      fontSize: '0.9rem',
+      fontWeight: '600',
+      fontFamily: FONT,
+      color: '#fff',
+      background: c.accent,
+      border: 'none',
+      borderRadius: '8px',
+      cursor: 'pointer',
+    });
+
+    form.appendChild(input);
+    form.appendChild(addBtn);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const v = input.value;
+      input.value = '';
+      void addTodo(v);
+    });
+    header.appendChild(form);
+
+    // Project-only toggle
+    const toggleRow = document.createElement('label');
+    Object.assign(toggleRow.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      fontSize: '0.8rem',
+      color: c.muted,
+      marginBottom: '14px',
+      cursor: ctx.project ? 'pointer' : 'not-allowed',
+      userSelect: 'none',
+    });
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = projectOnly;
+    toggle.disabled = !ctx.project;
+    toggle.style.cursor = ctx.project ? 'pointer' : 'not-allowed';
+    toggle.addEventListener('change', () => {
+      projectOnly = toggle.checked;
+      render();
+    });
+    const toggleText = document.createElement('span');
+    toggleText.textContent = ctx.project
+      ? `Current project only${projectOnly ? ` · ${ctx.project.name}` : ''}`
+      : 'Current project only (no project selected)';
+    toggleRow.appendChild(toggle);
+    toggleRow.appendChild(toggleText);
+    header.appendChild(toggleRow);
+
+    // Error
+    if (errorMsg) {
+      const err = document.createElement('div');
+      Object.assign(err.style, {
+        padding: '10px 12px',
+        marginBottom: '12px',
+        fontSize: '0.8rem',
+        color: c.danger,
+        background: c.surface,
+        border: `1px solid ${c.border}`,
+        borderRadius: '8px',
+      });
+      err.textContent = `✗ ${errorMsg}`;
+      header.appendChild(err);
+    }
+
+    // List
+    const list = document.createElement('div');
+    Object.assign(list.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
+
+    const items = visibleTodos();
+
+    if (!loaded) {
+      const loading = document.createElement('div');
+      Object.assign(loading.style, { padding: '24px 4px', fontSize: '0.85rem', color: c.muted });
+      loading.textContent = 'Loading…';
+      list.appendChild(loading);
+    } else if (items.length === 0) {
+      const empty = document.createElement('div');
+      Object.assign(empty.style, {
+        padding: '32px 16px',
+        textAlign: 'center',
+        fontSize: '0.85rem',
+        color: c.muted,
+      });
+      empty.textContent = projectOnly && ctx.project ? 'No todos for this project yet.' : 'No todos yet.';
+      list.appendChild(empty);
+    } else {
+      for (const todo of items) {
+        list.appendChild(renderRow(todo, c));
+      }
+    }
+
+    header.appendChild(list);
+    root.appendChild(header);
   }
 
-  async function load(ctx: PluginContext): Promise<void> {
-    if (!ctx.project) {
-      cache = null;
-      render(ctx, null);
-      return;
-    }
-    render(ctx, null);
-    try {
-      const stats = (await api.rpc('GET', `stats?path=${encodeURIComponent(ctx.project.path)}`)) as ProjectStats;
-      cache = { projectPath: ctx.project.path, stats };
-      render(ctx, stats);
-    } catch (err) {
-      const c = themeColors(ctx.theme === 'dark');
-      root.style.background = c.bg;
-      root.innerHTML = `
-        <div style="padding:24px;font-size:0.78rem;color:${c.accent};opacity:0.8;font-family:${MONO}">
-          ✗ ${(err as Error).message}
-        </div>`;
-    }
+  function renderRow(todo: Todo, c: ThemeColors): HTMLElement {
+    const row = document.createElement('div');
+    Object.assign(row.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '10px',
+      padding: '10px 12px',
+      background: c.surface,
+      border: `1px solid ${c.border}`,
+      borderRadius: '8px',
+    });
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = todo.done;
+    Object.assign(check.style, { flexShrink: '0', width: '16px', height: '16px', cursor: 'pointer' });
+    check.addEventListener('change', () => void toggleTodo(todo));
+
+    const text = document.createElement('span');
+    text.textContent = todo.text;
+    Object.assign(text.style, {
+      flex: '1',
+      minWidth: '0',
+      fontSize: '0.9rem',
+      wordBreak: 'break-word',
+      color: todo.done ? c.muted : c.text,
+      textDecoration: todo.done ? 'line-through' : 'none',
+    });
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = '✕';
+    del.title = 'Delete';
+    Object.assign(del.style, {
+      flexShrink: '0',
+      width: '26px',
+      height: '26px',
+      lineHeight: '1',
+      fontSize: '0.8rem',
+      color: c.muted,
+      background: 'transparent',
+      border: `1px solid ${c.border}`,
+      borderRadius: '6px',
+      cursor: 'pointer',
+    });
+    del.addEventListener('mouseover', () => {
+      del.style.color = c.danger;
+      del.style.borderColor = c.danger;
+    });
+    del.addEventListener('mouseout', () => {
+      del.style.color = c.muted;
+      del.style.borderColor = c.border;
+    });
+    del.addEventListener('click', () => void deleteTodo(todo));
+
+    row.appendChild(check);
+    row.appendChild(text);
+    row.appendChild(del);
+    return row;
   }
 
-  load(api.context);
+  // Initial load + react to context (theme / project) changes
+  void loadTodos();
 
-  const unsubscribe = api.onContextChange((ctx) => {
-    if (ctx.project?.path === cache?.projectPath) render(ctx, cache?.stats ?? null);
-    else load(ctx);
+  const unsubscribe = api.onContextChange(() => {
+    render();
   });
 
-  (container as any)._psUnsubscribe = unsubscribe;
+  (container as any)._todoUnsubscribe = unsubscribe;
 }
 
 export function unmount(container: HTMLElement): void {
-  if (typeof (container as any)._psUnsubscribe === 'function') {
-    (container as any)._psUnsubscribe();
-    delete (container as any)._psUnsubscribe;
+  if (typeof (container as any)._todoUnsubscribe === 'function') {
+    (container as any)._todoUnsubscribe();
+    delete (container as any)._todoUnsubscribe;
   }
   container.innerHTML = '';
 }
